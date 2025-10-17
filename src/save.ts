@@ -1,7 +1,6 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 
-import { cleanBin, cleanGit, cleanRegistry, cleanTargetDir } from "./cleanup";
 import { CacheConfig, isCacheUpToDate } from "./config";
 import { getCacheProvider, reportError } from "./utils";
 
@@ -34,47 +33,6 @@ async function run() {
     // TODO: remove this once https://github.com/actions/toolkit/pull/553 lands
     if (process.env["RUNNER_OS"] == "macOS") {
       await macOsWorkaround();
-    }
-
-    const workspaceCrates = core.getInput("cache-workspace-crates").toLowerCase() || "false";
-    const allPackages = [];
-    for (const workspace of config.workspaces) {
-      const packages = await workspace.getPackagesOutsideWorkspaceRoot();
-      if (workspaceCrates === "true") {
-        const wsMembers = await workspace.getWorkspaceMembers();
-        packages.push(...wsMembers);
-      }
-      allPackages.push(...packages);
-      try {
-        core.info(`... Cleaning ${workspace.target} ...`);
-        await cleanTargetDir(workspace.target, packages);
-      } catch (e) {
-        core.debug(`${(e as any).stack}`);
-      }
-    }
-
-    try {
-      const crates = core.getInput("cache-all-crates").toLowerCase() || "false";
-      core.info(`... Cleaning cargo registry (cache-all-crates: ${crates}) ...`);
-      await cleanRegistry(allPackages, crates !== "true");
-    } catch (e) {
-      core.debug(`${(e as any).stack}`);
-    }
-
-    if (config.cacheBin) {
-      try {
-        core.info(`... Cleaning cargo/bin ...`);
-        await cleanBin(config.cargoBins);
-      } catch (e) {
-        core.debug(`${(e as any).stack}`);
-      }
-    }
-
-    try {
-      core.info(`... Cleaning cargo git cache ...`);
-      await cleanGit(allPackages);
-    } catch (e) {
-      core.debug(`${(e as any).stack}`);
     }
 
     core.info(`... Saving cache ...`);

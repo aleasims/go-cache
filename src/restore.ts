@@ -1,6 +1,5 @@
 import * as core from "@actions/core";
 
-import { cleanTargetDir } from "./cleanup";
 import { CacheConfig } from "./config";
 import { getCacheProvider, reportError } from "./utils";
 
@@ -27,7 +26,6 @@ async function run() {
     var lookupOnly = core.getInput("lookup-only").toLowerCase() === "true";
 
     core.exportVariable("CACHE_ON_FAILURE", cacheOnFailure);
-    core.exportVariable("CARGO_INCREMENTAL", 0);
 
     const config = await CacheConfig.new();
     config.printInfo(cacheProvider);
@@ -45,12 +43,7 @@ async function run() {
       const match = restoreKey === key;
       core.info(`${lookupOnly ? "Found" : "Restored from"} cache key "${restoreKey}" full match: ${match}.`);
       if (!match) {
-        // pre-clean the target directory on cache mismatch
-        for (const workspace of config.workspaces) {
-          try {
-            await cleanTargetDir(workspace.target, [], true);
-          } catch {}
-        }
+        // TODO: pre-clean the cache directory on cache mismatch?
 
         // We restored the cache but it is not a full match.
         config.saveState();

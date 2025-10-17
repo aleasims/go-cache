@@ -15,8 +15,8 @@ inputs:
   env-vars:
     description: "Additional environment variables to include in the cache key, separated by spaces."
     required: false
-  workspaces:
-    description: "Paths to multiple Cargo workspaces and their target directories, separated by newlines."
+  modules:
+    description: "Paths to multiple Go modules, separated by newlines."
     required: false
   cache-directories:
     description: "Additional non workspace directories to be cached, separated by newlines."
@@ -33,7 +33,7 @@ inputs:
     required: false
     default: "github"
   cache-bin:
-    description: "Determines whether to cache ${CARGO_HOME}/bin."
+    description: "Determines whether to cache $GOBIN."
     required: false
     default: "true"
   lookup-only:

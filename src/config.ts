@@ -1,23 +1,19 @@
 import * as core from "@actions/core";
-import * as glob from "@actions/glob";
 import crypto from "crypto";
 import fs from "fs";
-import fs_promises from "fs/promises";
 import os from "os";
 import path from "path";
-import * as toml from "smol-toml";
 
-import { getCargoBins } from "./cleanup";
-import { CacheProvider, exists, getCmdOutput } from "./utils";
-import { Workspace } from "./workspace";
+import { CacheProvider, getCmdOutput } from "./utils";
 
 const HOME = os.homedir();
-export const CARGO_HOME = process.env.CARGO_HOME || path.join(HOME, ".cargo");
 
-const STATE_CONFIG = "RUST_CACHE_CONFIG";
+const STATE_CONFIG = "GO_CACHE_CONFIG";
 const HASH_LENGTH = 8;
 
 export class CacheConfig {
+  public goEnv: GoEnv = new GoEnv();
+
   /** All the paths we want to cache */
   public cachePaths: Array<string> = [];
   /** The primary cache key */
@@ -25,19 +21,19 @@ export class CacheConfig {
   /** The secondary (restore) key that only contains the prefix and environment */
   public restoreKey = "";
 
-  /** Whether to cache CARGO_HOME/.bin */
+  /** Whether to cache $GOBIN */
   public cacheBin: boolean = true;
 
-  /** The workspace configurations */
-  public workspaces: Array<Workspace> = [];
+  // /** The workspace configurations */
+  // public workspaces: Array<Workspace> = [];
 
-  /** The cargo binaries present during main step */
-  public cargoBins: Array<string> = [];
+  /** Go Module paths */
+  public modules: Array<string> = [];
 
   /** The prefix portion of the cache key */
   private keyPrefix = "";
-  /** The rust version considered for the cache key */
-  private keyRust = "";
+  /** The Go version considered for the cache key */
+  private keyGo = "";
   /** The environment variables considered for the cache key */
   private keyEnvs: Array<string> = [];
   /** The files considered for the cache key */
@@ -52,6 +48,7 @@ export class CacheConfig {
    */
   static async new(): Promise<CacheConfig> {
     const self = new CacheConfig();
+    const goEnv = await GoEnv.new();
 
     // Construct key prefix:
     // This uses either the `shared-key` input,
@@ -82,24 +79,21 @@ export class CacheConfig {
     self.keyPrefix = key;
 
     // Construct environment portion of the key:
-    // This consists of a hash that considers the rust version
+    // This consists of a hash that considers the Go version
     // as well as all the environment variables as given by a default list
     // and the `env-vars` input.
     // The env vars are sorted, matched by prefix and hashed into the
     // resulting environment hash.
 
     let hasher = crypto.createHash("sha1");
-    const rustVersion = await getRustVersion();
 
-    let keyRust = `${rustVersion.release} ${rustVersion.host}`;
-    hasher.update(keyRust);
-    hasher.update(rustVersion["commit-hash"]);
+    let keyGo = `${goEnv.GOVERSION} ${goEnv.GOHOSTARCH} ${goEnv.GOHOSTARCH}`;
+    hasher.update(keyGo);
 
-    keyRust += ` (${rustVersion["commit-hash"]})`;
-    self.keyRust = keyRust;
+    self.keyGo = keyGo;
 
-    // these prefixes should cover most of the compiler / rust / cargo keys
-    const envPrefixes = ["CARGO", "CC", "CFLAGS", "CXX", "CMAKE", "RUST"];
+    // these prefixes should cover most of the compiler / Go keys
+    const envPrefixes = ["CC", "CFLAGS", "CXX", "CMAKE", "GO", "CGO"];
     envPrefixes.push(...core.getInput("env-vars").split(/\s+/).filter(Boolean));
 
     // sort the available env vars so we have a more stable hash
@@ -126,109 +120,22 @@ export class CacheConfig {
 
     self.cacheBin = core.getInput("cache-bin").toLowerCase() == "true";
 
-    // Constructs the workspace config and paths to restore:
-    // The workspaces are given using a `$workspace -> $target` syntax.
-
-    const workspaces: Array<Workspace> = [];
-    const workspacesInput = core.getInput("workspaces") || ".";
-    for (const workspace of workspacesInput.trim().split("\n")) {
-      let [root, target = "target"] = workspace.split("->").map((s) => s.trim());
-      root = path.resolve(root);
-      target = path.join(root, target);
-      workspaces.push(new Workspace(root, target));
+    // Construct modules config
+    // The modules are given as a newline separated list of paths.
+    const modules: Array<string> = [];
+    const modulesInput = core.getInput("modules") || ".";
+    for (const module of modulesInput.trim().split("\n")) {
+      const root = path.resolve(module);
+      modules.push(root);
     }
-    self.workspaces = workspaces;
 
-    let keyFiles = await globFiles(".cargo/config.toml\nrust-toolchain\nrust-toolchain.toml");
-    const parsedKeyFiles = []; // keyFiles that are parsed, pre-processed and hashed
+    let keyFiles = [];
 
     hasher = crypto.createHash("sha1");
 
-    for (const workspace of workspaces) {
-      const root = workspace.root;
-      keyFiles.push(
-        ...(await globFiles(
-          `${root}/**/.cargo/config.toml\n${root}/**/rust-toolchain\n${root}/**/rust-toolchain.toml`,
-        )),
-      );
-
-      const workspaceMembers = await workspace.getWorkspaceMembers();
-
-      const cargo_manifests = sort_and_uniq(workspaceMembers.map((member) => path.join(member.path, "Cargo.toml")));
-
-      for (const cargo_manifest of cargo_manifests) {
-        try {
-          const content = await fs_promises.readFile(cargo_manifest, { encoding: "utf8" });
-          // Use any since TomlPrimitive is not exposed
-          const parsed = toml.parse(content) as { [key: string]: any };
-
-          if ("package" in parsed) {
-            const pack = parsed.package;
-            if ("version" in pack) {
-              pack["version"] = "0.0.0";
-            }
-          }
-
-          for (const prefix of ["", "build-", "dev-"]) {
-            const section_name = `${prefix}dependencies`;
-            if (!(section_name in parsed)) {
-              continue;
-            }
-            const deps = parsed[section_name];
-
-            for (const key of Object.keys(deps)) {
-              const dep = deps[key];
-
-              try {
-                if ("path" in dep) {
-                  dep.version = "0.0.0";
-                  dep.path = "";
-                }
-              } catch (_e) {
-                // Not an object, probably a string (version),
-                // continue.
-                continue;
-              }
-            }
-          }
-
-          hasher.update(JSON.stringify(parsed));
-
-          parsedKeyFiles.push(cargo_manifest);
-        } catch (e) {
-          // Fallback to caching them as regular file
-          core.warning(`Error parsing Cargo.toml manifest, fallback to caching entire file: ${e}`);
-          keyFiles.push(cargo_manifest);
-        }
-      }
-
-      const cargo_lock = path.join(workspace.root, "Cargo.lock");
-      if (await exists(cargo_lock)) {
-        try {
-          const content = await fs_promises.readFile(cargo_lock, { encoding: "utf8" });
-          const parsed = toml.parse(content);
-
-          if ((parsed.version !== 3 && parsed.version !== 4) || !("package" in parsed)) {
-            // Fallback to caching them as regular file since this action
-            // can only handle Cargo.lock format version 3
-            core.warning("Unsupported Cargo.lock format, fallback to caching entire file");
-            keyFiles.push(cargo_lock);
-            continue;
-          }
-
-          // Package without `[[package]].source` and `[[package]].checksum`
-          // are the one with `path = "..."` to crates within the workspace.
-          const packages = (parsed.package as any[]).filter((p: any) => "source" in p || "checksum" in p);
-
-          hasher.update(JSON.stringify(packages));
-
-          parsedKeyFiles.push(cargo_lock);
-        } catch (e) {
-          // Fallback to caching them as regular file
-          core.warning(`Error parsing Cargo.lock manifest, fallback to caching entire file: ${e}`);
-          keyFiles.push(cargo_lock);
-        }
-      }
+    for (const module of modules) {
+      const cargo_lock = path.join(module, "go.mod");
+      keyFiles.push(cargo_lock);
     }
     keyFiles = sort_and_uniq(keyFiles);
 
@@ -240,33 +147,23 @@ export class CacheConfig {
 
     let lockHash = digest(hasher);
 
-    keyFiles.push(...parsedKeyFiles);
     self.keyFiles = sort_and_uniq(keyFiles);
 
     key += `-${lockHash}`;
     self.cacheKey = key;
 
-    self.cachePaths = [path.join(CARGO_HOME, "registry"), path.join(CARGO_HOME, "git")];
+    self.cachePaths = [goEnv.GOCACHE, goEnv.GOMODCACHE];
     if (self.cacheBin) {
       self.cachePaths = [
-        path.join(CARGO_HOME, "bin"),
-        path.join(CARGO_HOME, ".crates.toml"),
-        path.join(CARGO_HOME, ".crates2.json"),
+        goEnv.GOBIN,
         ...self.cachePaths,
       ];
-    }
-    const cacheTargets = core.getInput("cache-targets").toLowerCase() || "true";
-    if (cacheTargets === "true") {
-      self.cachePaths.push(...workspaces.map((ws) => ws.target));
     }
 
     const cacheDirectories = core.getInput("cache-directories");
     for (const dir of cacheDirectories.trim().split(/\s+/).filter(Boolean)) {
       self.cachePaths.push(dir);
     }
-
-    const bins = await getCargoBins();
-    self.cargoBins = Array.from(bins.values());
 
     return self;
   }
@@ -287,7 +184,6 @@ export class CacheConfig {
 
     const self = new CacheConfig();
     Object.assign(self, JSON.parse(source));
-    self.workspaces = self.workspaces.map((w: any) => new Workspace(w.root, w.target));
 
     return self;
   }
@@ -299,9 +195,9 @@ export class CacheConfig {
     core.startGroup("Cache Configuration");
     core.info(`Cache Provider:`);
     core.info(`    ${cacheProvider.name}`);
-    core.info(`Workspaces:`);
-    for (const workspace of this.workspaces) {
-      core.info(`    ${workspace.root}`);
+    core.info(`Modules:`);
+    for (const mod of this.modules) {
+      core.info(`    ${mod}`);
     }
     core.info(`Cache Paths:`);
     for (const path of this.cachePaths) {
@@ -314,7 +210,7 @@ export class CacheConfig {
     core.info(`.. Prefix:`);
     core.info(`  - ${this.keyPrefix}`);
     core.info(`.. Environment considered:`);
-    core.info(`  - Rust Version: ${this.keyRust}`);
+    core.info(`  - Go Version: ${this.keyGo}`);
     for (const env of this.keyEnvs) {
       core.info(`  - ${env}`);
     }
@@ -353,30 +249,42 @@ function digest(hasher: crypto.Hash): string {
   return hasher.digest("hex").substring(0, HASH_LENGTH);
 }
 
-interface RustVersion {
-  host: string;
-  release: string;
-  "commit-hash": string;
-}
+class GoEnv {
+  public GOARCH: string = "";
+  public GOBIN: string = "";
+  public GOCACHE: string = "";
+  public GOENV: string = "";
+  public GOHOSTARCH: string = "";
+  public GOHOSTOS: string = "";
+  public GOMODCACHE: string = "";
+  public GOOS: string = "";
+  public GOPATH: string = "";
+  public GOVERSION: string = "";
 
-async function getRustVersion(): Promise<RustVersion> {
-  const stdout = await getCmdOutput("rustc", ["-vV"]);
-  let splits = stdout
-    .split(/[\n\r]+/)
-    .filter(Boolean)
-    .map((s) => s.split(":").map((s) => s.trim()))
-    .filter((s) => s.length === 2);
-  return Object.fromEntries(splits);
-}
+  public constructor() {}
 
-async function globFiles(pattern: string): Promise<string[]> {
-  const globber = await glob.create(pattern, {
-    followSymbolicLinks: false,
-  });
-  // fs.statSync resolve the symbolic link and returns stat for the
-  // file it pointed to, so isFile would make sure the resolved
-  // file is actually a regular file.
-  return (await globber.glob()).filter((file) => fs.statSync(file).isFile());
+  /** 
+   * Create new env reading from `go env` and setting default values.
+   *
+   * E.g. if GOBIN is not set, it will be defaulted to GOPATH/bin
+   */
+  static async new(): Promise<GoEnv> {
+    const output = await getCmdOutput("go", ["env", "-json"]);
+    let goEnv: GoEnv = JSON.parse(output);
+    if (goEnv.GOPATH === "") {
+      goEnv.GOPATH = path.join(HOME, "go");
+    }
+    if (goEnv.GOBIN === "") {
+      goEnv.GOBIN = path.join(goEnv.GOPATH, "bin");
+    }
+    if (goEnv.GOMODCACHE === "") {
+      goEnv.GOMODCACHE = path.join(goEnv.GOPATH, "pkg", "mod");
+    }
+    if (goEnv.GOCACHE === "") {
+      goEnv.GOCACHE = path.join(HOME, ".cache", "go-build")
+    }
+    return goEnv;
+  }
 }
 
 function sort_and_uniq(a: string[]) {
